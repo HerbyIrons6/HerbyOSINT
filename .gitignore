@@ -1,0 +1,20 @@
+# Секреты
+.env
+
+# Виртуальное окружение и кэш
+venv/
+__pycache__/
+*.pyc
+
+# Временные файлы пользователей
+report_*.txt
+c2pa_report_*.txt
+*.svg
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.pdf
+
+.idea/
+.venv/

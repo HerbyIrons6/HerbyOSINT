@@ -1,3 +1,4 @@
+import json
 import os
 import time
 import subprocess
@@ -64,7 +65,9 @@ def download_document(message) -> str | None:
     file_info = bot.get_file(message.document.file_id)
     downloaded_file = bot.download_file(file_info.file_path)
 
-    safe_filename = f"{message.chat.id}_{int(time.time())}_{message.document.file_name}"
+    # Санитизация имени файла для защиты от Path Traversal
+    ext = os.path.splitext(message.document.file_name)[1]
+    safe_filename = f"{message.chat.id}_{int(time.time())}{ext}"
 
     with open(safe_filename, 'wb') as f:
         f.write(downloaded_file)
@@ -76,7 +79,8 @@ def process_check_step(message):
     filepath = download_document(message)
     if not filepath: return
 
-    report_name = f"report_{filepath}.txt"
+    # Упрощенное имя отчета без дублирования расширений
+    report_name = f"report_{message.chat.id}_{int(time.time())}.txt"
     try:
         bot.send_message(message.chat.id, "Анализ файла...")
         success = execute_check(filepath, report_name)
@@ -87,6 +91,8 @@ def process_check_step(message):
         else:
             bot.send_message(message.chat.id, "Не удалось извлечь метаданные.")
 
+    except json.JSONDecodeError:
+        bot.reply_to(message, "Ошибка: Не удалось распарсить метаданные (поврежденный или неподдерживаемый формат).")
     except subprocess.TimeoutExpired:
         bot.reply_to(message, "Таймаут: процесс завис на чтении файла.")
     except Exception as e:
@@ -94,7 +100,6 @@ def process_check_step(message):
     finally:
         if os.path.exists(filepath): os.remove(filepath)
         if os.path.exists(report_name): os.remove(report_name)
-
 
 def process_clean_step(message):
     filepath = download_document(message)

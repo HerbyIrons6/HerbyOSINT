@@ -4,11 +4,13 @@ import time
 import json
 import threading
 import subprocess
+import tempfile
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 
 from texts import TEXTS
+from security import is_safe_file
 from processing import execute_check, execute_check_short, execute_clean, execute_extract
 
 load_dotenv()
@@ -73,7 +75,6 @@ user_langs = load_langs()
 
 
 def get_lang(uid: int) -> str:
-    """Отримує мову користувача (за замовчуванням 'en')"""
     return user_langs.get(str(uid), 'en')
 
 
@@ -113,10 +114,10 @@ def _after_extract_kb(lang: str) -> InlineKeyboardMarkup:
 
 
 # ─── Helpers ───────────────────────────────────────────────────────
-def _send_safe(chat_id: int, filepath: str, caption: str = ""):
+def _send_safe(chat_id: int, filepath: str, caption: str = "", display_name: str = ""):
     with open(filepath, "rb") as f:
         buf = io.BytesIO(f.read())
-    buf.name = os.path.basename(filepath)
+    buf.name = display_name if display_name else os.path.basename(filepath)
     bot.send_document(chat_id, buf, caption=caption)
 
 
@@ -127,20 +128,17 @@ def _typing(uid: int):
         pass
 
 
-def _download(file_id: str, uid: int, file_name: str = "file") -> str | None:
+def _download(file_id: str, uid: int, save_path: str) -> bool:
     try:
         info = bot.get_file(file_id)
         data = bot.download_file(info.file_path)
-        ext = os.path.splitext(file_name)[1] or '.bin'
-        ext = ext[:10]  # Санітизація розширення
-        path = f"tmp_{uid}_{int(time.time())}{ext}"
-        with open(path, 'wb') as f:
+        with open(save_path, 'wb') as f:
             f.write(data)
-        return path
+        return True
     except Exception as e:
         lang = get_lang(uid)
         bot.send_message(uid, TEXTS[lang]['error'].format(error=e))
-        return None
+        return False
 
 
 def _c2pa_summary(report_path: str) -> str:
@@ -266,46 +264,52 @@ def _run(uid: int, action: str, meta: dict, lang: str):
     _set_busy(uid)
     _typing(uid)
 
-    filepath = _download(meta['file_id'], uid, meta['file_name'])
-    if not filepath:
-        _set_free(uid)
-        return
-
-    report = f"rpt_{uid}_{int(time.time())}.txt"
-
     try:
-        if action == "short":
-            _typing(uid)
-            if execute_check_short(filepath, report, meta['file_name']):
-                _send_safe(uid, report, TEXTS[lang]['short_report'])
-                bot.send_message(uid, TEXTS[lang]['more_actions'], reply_markup=_action_kb(lang))
-            else:
-                bot.send_message(uid, TEXTS[lang]['extract_failed'])
+        # Автовидалення і повна ізоляція файлів
+        with tempfile.TemporaryDirectory() as temp_dir:
 
-        elif action == "full":
-            _typing(uid)
-            if execute_check(filepath, report, meta['file_name']):
-                _send_safe(uid, report, TEXTS[lang]['full_report'])
-                bot.send_message(uid, TEXTS[lang]['more_actions'], reply_markup=_action_kb(lang))
-            else:
-                bot.send_message(uid, TEXTS[lang]['extract_failed'])
+            filepath = os.path.join(temp_dir, "target_media")
+            report = os.path.join(temp_dir, "report.txt")
 
-        elif action == "extract":
-            _typing(uid)
-            if execute_extract(filepath, report):
-                summary = _c2pa_summary(report)
-                bot.send_message(uid, TEXTS[lang]['c2pa_found'].format(summary=summary), parse_mode='Markdown')
-                _send_safe(uid, report, TEXTS[lang]['c2pa_report'])
-                bot.send_message(uid, TEXTS[lang]['c2pa_clean_ask'], reply_markup=_after_extract_kb(lang))
-            else:
-                bot.send_message(uid, TEXTS[lang]['c2pa_not_found'], parse_mode='Markdown')
+            if not _download(meta['file_id'], uid, filepath):
+                return
 
-        elif action == "clean_yes":
-            _typing(uid)
-            rc = execute_clean(filepath)
-            caption = TEXTS[lang]['clean_success'] if rc == 0 else TEXTS[lang]['clean_partial']
-            _send_safe(uid, filepath, caption)
-            bot.send_message(uid, TEXTS[lang]['send_again'])
+            if not is_safe_file(filepath):
+                bot.send_message(uid, TEXTS[lang]['invalid_format'])
+                return
+
+            if action == "short":
+                _typing(uid)
+                if execute_check_short(filepath, report, meta['file_name']):
+                    _send_safe(uid, report, TEXTS[lang]['short_report'], display_name=f"short_{meta['file_name']}.txt")
+                    bot.send_message(uid, TEXTS[lang]['more_actions'], reply_markup=_action_kb(lang))
+                else:
+                    bot.send_message(uid, TEXTS[lang]['extract_failed'])
+
+            elif action == "full":
+                _typing(uid)
+                if execute_check(filepath, report, meta['file_name']):
+                    _send_safe(uid, report, TEXTS[lang]['full_report'], display_name=f"full_{meta['file_name']}.txt")
+                    bot.send_message(uid, TEXTS[lang]['more_actions'], reply_markup=_action_kb(lang))
+                else:
+                    bot.send_message(uid, TEXTS[lang]['extract_failed'])
+
+            elif action == "extract":
+                _typing(uid)
+                if execute_extract(filepath, report):
+                    summary = _c2pa_summary(report)
+                    bot.send_message(uid, TEXTS[lang]['c2pa_found'].format(summary=summary), parse_mode='Markdown')
+                    _send_safe(uid, report, TEXTS[lang]['c2pa_report'], display_name=f"c2pa_{meta['file_name']}.txt")
+                    bot.send_message(uid, TEXTS[lang]['c2pa_clean_ask'], reply_markup=_after_extract_kb(lang))
+                else:
+                    bot.send_message(uid, TEXTS[lang]['c2pa_not_found'], parse_mode='Markdown')
+
+            elif action == "clean_yes":
+                _typing(uid)
+                rc = execute_clean(filepath)
+                caption = TEXTS[lang]['clean_success'] if rc == 0 else TEXTS[lang]['clean_partial']
+                _send_safe(uid, filepath, caption, display_name=meta['file_name'])
+                bot.send_message(uid, TEXTS[lang]['send_again'])
 
     except subprocess.TimeoutExpired:
         bot.send_message(uid, TEXTS[lang]['timeout'])
@@ -315,12 +319,6 @@ def _run(uid: int, action: str, meta: dict, lang: str):
         bot.send_message(uid, TEXTS[lang]['error'].format(error=e))
     finally:
         _set_free(uid)
-        for f in [filepath, report]:
-            if f and os.path.exists(f):
-                try:
-                    os.remove(f)
-                except:
-                    pass
 
 
 if __name__ == '__main__':

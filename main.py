@@ -1,96 +1,149 @@
 import io
 import os
 import time
+import json
 import threading
 import subprocess
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from config import TOKEN, MAX_FILE_SIZE
+from dotenv import load_dotenv
+
+from texts import TEXTS
 from processing import execute_check, execute_check_short, execute_clean, execute_extract
 
+load_dotenv()
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("Токен бота не знайдено. Перевірте файл .env")
+
+MAX_FILE_SIZE = 20 * 1024 * 1024
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=4)
 
 # ─── Thread-safe state ─────────────────────────────────────────────
-_active:  set[int]        = set()
-_pending: dict[int, dict] = {}   # uid → {file_id, file_name, file_size}
+_active: set[int] = set()
+_pending: dict[int, dict] = {}
 _lock = threading.Lock()
+
 
 def _is_busy(uid: int) -> bool:
     with _lock: return uid in _active
 
+
 def _set_busy(uid: int):
     with _lock: _active.add(uid)
 
+
 def _set_free(uid: int):
     with _lock: _active.discard(uid)
+
 
 def _set_pending(uid: int, file_id: str, file_name: str, file_size: int):
     with _lock:
         _pending[uid] = {'file_id': file_id, 'file_name': file_name, 'file_size': file_size}
 
+
 def _get_pending(uid: int) -> dict | None:
     with _lock: return _pending.get(uid)
+
 
 def _clear_pending(uid: int):
     with _lock: _pending.pop(uid, None)
 
+
+# ─── Language state ────────────────────────────────────────────────
+LANG_FILE = "langs.json"
+
+
+def load_langs() -> dict:
+    if os.path.exists(LANG_FILE):
+        try:
+            with open(LANG_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+
+def save_langs(data: dict):
+    with open(LANG_FILE, 'w') as f:
+        json.dump(data, f)
+
+
+user_langs = load_langs()
+
+
+def get_lang(uid: int) -> str:
+    """Отримує мову користувача (за замовчуванням 'en')"""
+    return user_langs.get(str(uid), 'en')
+
+
 # ─── Keyboards ─────────────────────────────────────────────────────
-def _action_kb() -> InlineKeyboardMarkup:
+def _action_kb(lang: str) -> InlineKeyboardMarkup:
+    t = TEXTS[lang]
     kb = InlineKeyboardMarkup(row_width=2)
     kb.row(
-        InlineKeyboardButton("⚡ Кратко",   callback_data="do:short"),
-        InlineKeyboardButton("📋 Полный",   callback_data="do:full"),
+        InlineKeyboardButton(t['btn_short'], callback_data="do:short"),
+        InlineKeyboardButton(t['btn_full'], callback_data="do:full"),
     )
     kb.row(
-        InlineKeyboardButton("🛡 C2PA",     callback_data="do:extract"),
-        InlineKeyboardButton("🧹 Очистить", callback_data="do:clean"),
+        InlineKeyboardButton(t['btn_c2pa'], callback_data="do:extract"),
+        InlineKeyboardButton(t['btn_clean'], callback_data="do:clean"),
     )
     return kb
 
-def _confirm_clean_kb() -> InlineKeyboardMarkup:
+
+def _confirm_clean_kb(lang: str) -> InlineKeyboardMarkup:
+    t = TEXTS[lang]
     kb = InlineKeyboardMarkup()
     kb.row(
-        InlineKeyboardButton("✅ Да, удалить", callback_data="do:clean_yes"),
-        InlineKeyboardButton("❌ Отмена",      callback_data="do:cancel"),
+        InlineKeyboardButton(t['btn_yes'], callback_data="do:clean_yes"),
+        InlineKeyboardButton(t['btn_no'], callback_data="do:cancel"),
     )
     return kb
 
-def _after_extract_kb() -> InlineKeyboardMarkup:
-    """Показывается если C2PA найдена — предлагаем очистить."""
+
+def _after_extract_kb(lang: str) -> InlineKeyboardMarkup:
+    t = TEXTS[lang]
     kb = InlineKeyboardMarkup()
     kb.row(
-        InlineKeyboardButton("🧹 Удалить AI-маркировку", callback_data="do:clean"),
-        InlineKeyboardButton("📋 Полный отчёт",           callback_data="do:full"),
+        InlineKeyboardButton(t['btn_clean_ai'], callback_data="do:clean"),
+        InlineKeyboardButton(t['btn_full'], callback_data="do:full"),
     )
     return kb
+
 
 # ─── Helpers ───────────────────────────────────────────────────────
 def _send_safe(chat_id: int, filepath: str, caption: str = ""):
-    """Читает файл в BytesIO → WinError 32 невозможен."""
     with open(filepath, "rb") as f:
         buf = io.BytesIO(f.read())
     buf.name = os.path.basename(filepath)
     bot.send_document(chat_id, buf, caption=caption)
 
+
 def _typing(uid: int):
-    try: bot.send_chat_action(uid, 'upload_document')
-    except: pass
+    try:
+        bot.send_chat_action(uid, 'upload_document')
+    except:
+        pass
+
 
 def _download(file_id: str, uid: int, file_name: str = "file") -> str | None:
     try:
         info = bot.get_file(file_id)
         data = bot.download_file(info.file_path)
-        ext  = os.path.splitext(file_name)[1] or '.bin'   # .mp4 / .png / .jpg ...
+        ext = os.path.splitext(file_name)[1] or '.bin'
+        ext = ext[:10]  # Санітизація розширення
         path = f"tmp_{uid}_{int(time.time())}{ext}"
         with open(path, 'wb') as f:
             f.write(data)
         return path
     except Exception as e:
-        bot.send_message(uid, f"❌ Не удалось скачать файл: {e}")
+        lang = get_lang(uid)
+        bot.send_message(uid, TEXTS[lang]['error'].format(error=e))
         return None
 
+
 def _c2pa_summary(report_path: str) -> str:
-    """Достаёт ключевые строки из C2PA-отчёта для показа прямо в чате."""
     def find(label: str) -> str | None:
         with open(report_path, encoding='utf-8') as f:
             for line in f:
@@ -99,103 +152,117 @@ def _c2pa_summary(report_path: str) -> str:
         return None
 
     parts = []
-    if v := find('Инструмент'): parts.append(f"📌 Генератор: `{v}`")
-    if v := find('Агент'):      parts.append(f"🤖 Агент: `{v}`")
-    if v := find('Спека C2PA'): parts.append(f"📋 Спека: C2PA {v}")
-    if v := find('Тип источника'): parts.append(f"🔍 {v}")
-    return '\n'.join(parts) or "Подробности в прикреплённом файле."
+    if v := find('Tool'):  parts.append(f"📌 Generator: `{v}`")
+    if v := find('Agent'): parts.append(f"🤖 Agent: `{v}`")
+    if v := find('Spec'):  parts.append(f"📋 Spec: {v}")
+    return '\n'.join(parts) or "Details in the attached file."
 
-# ─── Команды ───────────────────────────────────────────────────────
-@bot.message_handler(commands=['start', 'help'])
+
+# ─── Команди ───────────────────────────────────────────────────────
+@bot.message_handler(commands=['start', 'help', 'lang'])
 def on_start(message):
-    bot.reply_to(message,
-        "👋 Отправьте любой файл как *Документ* — я предложу что с ним сделать.\n\n"
-        "📌 Доступные операции:\n"
-        "  ⚡ *Кратко* — ключевые метаданные\n"
-        "  📋 *Полный* — все метаданные\n"
-        "  🛡 *C2PA* — проверка AI-маркировки\n"
-        "  🧹 *Очистить* — удалить метаданные\n\n"
-        "🛑 /cancel — отменить текущую операцию\n\n"
-        "_Важно: файлы отправляйте через Файл → Документ, не как фото/видео._",
-        parse_mode='Markdown'
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("🇺🇦 Українська", callback_data="lang:ua"),
+        InlineKeyboardButton("🇬🇧 English", callback_data="lang:en")
     )
+    bot.reply_to(message, TEXTS['en']['choose_lang'], reply_markup=kb)
+
 
 @bot.message_handler(commands=['cancel'])
 def on_cancel(message):
     uid = message.chat.id
+    lang = get_lang(uid)
     bot.clear_step_handler_by_chat_id(uid)
     _set_free(uid)
     _clear_pending(uid)
-    bot.reply_to(message, "🛑 Операция отменена.")
+    bot.reply_to(message, TEXTS[lang]['cancelled'])
 
-# ─── Входящие файлы ────────────────────────────────────────────────
+
+# ─── Обробка мови ──────────────────────────────────────────────────
+@bot.callback_query_handler(func=lambda c: c.data.startswith("lang:"))
+def on_language_select(call):
+    uid = call.message.chat.id
+    lang = call.data.split(':')[1]
+
+    user_langs[str(uid)] = lang
+    save_langs(user_langs)
+
+    bot.answer_callback_query(call.id, TEXTS[lang]['lang_set'])
+    bot.edit_message_text(
+        TEXTS[lang]['welcome'],
+        uid,
+        call.message.message_id,
+        parse_mode='Markdown'
+    )
+
+
+# ─── Вхідні файли ──────────────────────────────────────────────────
 @bot.message_handler(content_types=['document'])
 def on_document(message):
     uid = message.chat.id
+    lang = get_lang(uid)
     doc = message.document
 
     if _is_busy(uid):
-        bot.reply_to(message, "⏳ Дождитесь завершения текущей операции или /cancel.")
+        bot.reply_to(message, TEXTS[lang]['wait'])
         return
 
     if doc.file_size > MAX_FILE_SIZE:
-        bot.reply_to(message, "❌ Файл превышает лимит Telegram API (20 МБ).")
+        bot.reply_to(message, TEXTS[lang]['file_too_big'])
         return
 
     _set_pending(uid, doc.file_id, doc.file_name or "file", doc.file_size)
 
-    size_str = f"{doc.file_size / (1024 * 1024):.1f} МБ"
+    size_str = f"{doc.file_size / (1024 * 1024):.1f} MB"
+    msg_text = TEXTS[lang]['what_to_do'].format(name=doc.file_name, size=size_str)
+
     bot.reply_to(
-        message,
-        f"📎 `{doc.file_name}`  ·  {size_str}\n\nЧто сделать с файлом?",
-        reply_markup=_action_kb(),
+        message, msg_text,
+        reply_markup=_action_kb(lang),
         parse_mode='Markdown'
     )
+
 
 @bot.message_handler(content_types=['photo', 'video'])
 def on_compressed(message):
-    bot.reply_to(message,
-        "⚠️ Telegram сжал файл и удалил метаданные.\n"
-        "Отправьте его через *Файл → Документ*.",
-        parse_mode='Markdown'
-    )
+    uid = message.chat.id
+    lang = get_lang(uid)
+    bot.reply_to(message, TEXTS[lang]['compressed'], parse_mode='Markdown')
 
-# ─── Кнопки ────────────────────────────────────────────────────────
+
+# ─── Кнопки дій ────────────────────────────────────────────────────
 @bot.callback_query_handler(func=lambda c: c.data.startswith("do:"))
 def on_action(call):
-    uid    = call.message.chat.id
+    uid = call.message.chat.id
+    lang = get_lang(uid)
     action = call.data.split(':', 1)[1]
 
     if action == "cancel":
-        bot.answer_callback_query(call.id, "Отменено.")
+        bot.answer_callback_query(call.id, TEXTS[lang]['cancelled'])
         bot.delete_message(uid, call.message.message_id)
         return
 
     if _is_busy(uid):
-        bot.answer_callback_query(call.id, "⏳ Уже выполняется операция!")
+        bot.answer_callback_query(call.id, TEXTS[lang]['already_running'])
         return
 
     meta = _get_pending(uid)
     if not meta:
-        bot.answer_callback_query(call.id, "❌ Файл устарел. Отправьте снова.")
+        bot.answer_callback_query(call.id, TEXTS[lang]['file_old'])
         return
 
-    # Очистка — сначала подтверждение
     if action == "clean":
         bot.answer_callback_query(call.id)
-        bot.send_message(
-            uid,
-            f"⚠️ Метаданные файла `{meta['file_name']}` будут удалены *безвозвратно*.\n\nПродолжить?",
-            reply_markup=_confirm_clean_kb(),
-            parse_mode='Markdown'
-        )
+        msg = TEXTS[lang]['confirm_clean'].format(name=meta['file_name'])
+        bot.send_message(uid, msg, reply_markup=_confirm_clean_kb(lang), parse_mode='Markdown')
         return
 
     bot.answer_callback_query(call.id)
-    _run(uid, action, meta)
+    _run(uid, action, meta, lang)
 
 
-def _run(uid: int, action: str, meta: dict):
+def _run(uid: int, action: str, meta: dict, lang: str):
     _set_busy(uid)
     _typing(uid)
 
@@ -210,64 +277,52 @@ def _run(uid: int, action: str, meta: dict):
         if action == "short":
             _typing(uid)
             if execute_check_short(filepath, report, meta['file_name']):
-                _send_safe(uid, report, "⚡ Краткий отчёт по метаданным.")
-                bot.send_message(uid, "Ещё что-то сделать с этим файлом?",
-                                 reply_markup=_action_kb())
+                _send_safe(uid, report, TEXTS[lang]['short_report'])
+                bot.send_message(uid, TEXTS[lang]['more_actions'], reply_markup=_action_kb(lang))
             else:
-                bot.send_message(uid, "⚠️ Не удалось извлечь метаданные.")
+                bot.send_message(uid, TEXTS[lang]['extract_failed'])
 
         elif action == "full":
             _typing(uid)
             if execute_check(filepath, report, meta['file_name']):
-                _send_safe(uid, report, "📋 Полный отчёт по метаданным.")
-                bot.send_message(uid, "Ещё что-то сделать с этим файлом?",
-                                 reply_markup=_action_kb())
+                _send_safe(uid, report, TEXTS[lang]['full_report'])
+                bot.send_message(uid, TEXTS[lang]['more_actions'], reply_markup=_action_kb(lang))
             else:
-                bot.send_message(uid, "⚠️ Не удалось извлечь метаданные.")
+                bot.send_message(uid, TEXTS[lang]['extract_failed'])
 
         elif action == "extract":
             _typing(uid)
             if execute_extract(filepath, report):
                 summary = _c2pa_summary(report)
-                bot.send_message(uid,
-                    f"🛡 *C2PA-маркировка обнаружена*\n\n{summary}",
-                    parse_mode='Markdown'
-                )
-                _send_safe(uid, report, "📄 Полный C2PA-отчёт")
-                bot.send_message(uid, "Хотите удалить AI-маркировку из файла?",
-                                 reply_markup=_after_extract_kb())
+                bot.send_message(uid, TEXTS[lang]['c2pa_found'].format(summary=summary), parse_mode='Markdown')
+                _send_safe(uid, report, TEXTS[lang]['c2pa_report'])
+                bot.send_message(uid, TEXTS[lang]['c2pa_clean_ask'], reply_markup=_after_extract_kb(lang))
             else:
-                bot.send_message(uid,
-                    "✅ *AI-маркировка не обнаружена*\n\n"
-                    "Файл не содержит C2PA-манифеста или он был удалён.",
-                    parse_mode='Markdown'
-                )
-
+                bot.send_message(uid, TEXTS[lang]['c2pa_not_found'], parse_mode='Markdown')
 
         elif action == "clean_yes":
             _typing(uid)
             rc = execute_clean(filepath)
-            if rc == 0:
-                caption = "✅ Все метаданные удалены."
-            else:
-                caption = "✅ Метаданные удалены (часть служебных тегов MP4/видео сохранена — это норма)."
+            caption = TEXTS[lang]['clean_success'] if rc == 0 else TEXTS[lang]['clean_partial']
             _send_safe(uid, filepath, caption)
-            bot.send_message(uid, "Отправьте файл снова, чтобы убедиться в результате.")
+            bot.send_message(uid, TEXTS[lang]['send_again'])
 
     except subprocess.TimeoutExpired:
-        bot.send_message(uid, "⏱ Таймаут. Попробуйте ещё раз.")
+        bot.send_message(uid, TEXTS[lang]['timeout'])
     except FileNotFoundError:
-        bot.send_message(uid, "❌ exiftool не найден в системе.")
+        bot.send_message(uid, TEXTS[lang]['no_exiftool'])
     except Exception as e:
-        bot.send_message(uid, f"❌ Ошибка: {e}")
+        bot.send_message(uid, TEXTS[lang]['error'].format(error=e))
     finally:
         _set_free(uid)
         for f in [filepath, report]:
             if f and os.path.exists(f):
-                try: os.remove(f)
-                except: pass
+                try:
+                    os.remove(f)
+                except:
+                    pass
 
 
 if __name__ == '__main__':
-    print("Инициализация сервиса...")
+    print("Ініціалізація сервісу...")
     bot.infinity_polling(skip_pending=True)
